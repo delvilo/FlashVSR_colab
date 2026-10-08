@@ -7,7 +7,6 @@ tqdm
 pillow
 huggingface_hub
 triton
-sageattention
 psutil
 opencv-python>=4.8.1.78
 pyyaml
