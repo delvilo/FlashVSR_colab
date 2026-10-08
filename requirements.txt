@@ -10,3 +10,6 @@ triton
 psutil
 opencv-python>=4.8.1.78
 pyyaml
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl
+https://huggingface.co/pseudobacon/SageAttention2/resolve/main/sageattention-2.2.0%2Bcu130torch2.11.0andhigher-cp39-abi3-linux_x86_64.whl --no-deps
+https://huggingface.co/pseudobacon/SpargeAttn/resolve/main/spas_sage_attn-0.1.0%2Bcu130torch2.11.0andhigher-cp39-abi3-linux_x86_64.whl --no-deps
