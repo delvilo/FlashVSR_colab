@@ -140,6 +140,24 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Upscaling factor. 2x or 4x. Higher scale requires more VRAM and compute. (default: 2)'
     )
     parser.add_argument(
+        '--resolution',
+        type=int,
+        default=None,
+        help='Target short-side resolution in pixels (e.g. 720, 1080, 1440). Automatically selects 2x or 4x model and scales to target. Overrides --scale if specified.'
+    )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        default=False,
+        help='Resume long video upscaling from existing chunk checkpoints across sessions.'
+    )
+    parser.add_argument(
+        '--keep_temp',
+        action='store_true',
+        default=False,
+        help='Keep intermediate chunk checkpoint video files after assembly.'
+    )
+    parser.add_argument(
         '--color_fix',
         action='store_true',
         default=True,
@@ -585,9 +603,9 @@ class VideoWriter:
             try:
                 if self.proc.stdin:
                     self.proc.stdin.close()
+                self.proc.wait()
                 if self.proc.stderr:
                     self.proc.stderr.close()
-                self.proc.wait()
             except Exception:
                 pass
             self.proc = None
@@ -666,12 +684,46 @@ def main():
         end_frame=args.end_frame,
         chunk_size=args.frame_chunk_size
     )
-    
     input_fps, file_total_frames = reader.get_info()
-    
-    # Calculate actual frames to process based on reader's resolved range
     total_frames_to_process = reader.end_frame - reader.start_frame
     
+    # Audio source resolution
+    if args.audio and os.path.exists(args.audio):
+        audio_source = args.audio
+    elif args.keep_audio:
+        audio_source = args.input
+    else:
+        audio_source = None
+
+    # Resolution resolution: compute target dimensions and effective model scale
+    if args.resolution is not None and args.resolution > 0:
+        from src.processor import resolve_target_resolution
+        target_w, target_h, eff_scale = resolve_target_resolution(reader.width, reader.height, resolution=args.resolution, scale=args.scale)
+        args.scale = eff_scale
+        resolved_out = resolve_filename_prefix(args.output, width=target_w, height=target_h)
+        print(f"Target resolution: {args.resolution}px (short edge) -> {target_w}x{target_h} (using {eff_scale}x model)")
+    else:
+        w_est = reader.width * args.scale
+        h_est = reader.height * args.scale
+        resolved_out = resolve_filename_prefix(args.output, width=w_est, height=h_est)
+
+    # Resumable setup
+    resumable_mode = bool(args.resume)
+    chunks_dir = None
+    manifest = None
+    if resumable_mode:
+        from src.resumable import (
+            get_resume_dir, load_resume_manifest, save_resume_manifest,
+            assemble_chunks, cleanup_chunks
+        )
+        chunks_dir = get_resume_dir(resolved_out)
+        manifest = load_resume_manifest(chunks_dir)
+        if manifest is None:
+            manifest = {"input": args.input, "chunks": [], "completed_frames": 0}
+            save_resume_manifest(chunks_dir, manifest)
+        else:
+            print(f"[RESUME] Found existing manifest: {len(manifest.get('chunks', []))} chunks ({manifest.get('completed_frames', 0)} frames) completed.")
+
     if args.end_frame > 0 or args.start_frame > 0:
         print(f"Input: {args.input} ({input_fps:.2f} FPS)")
         print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
@@ -731,7 +783,6 @@ def main():
     writer = None
     total_processed = 0
     start_time_glob = 0
-    resolved_out = None
     temp_path = None
     processing_error = None
     try:
@@ -739,9 +790,17 @@ def main():
         start_time_glob = time.time()
         
         for chunk_idx, frames in enumerate(reader):
+            # In resumable mode, check if chunk was already completed
+            if resumable_mode and chunks_dir is not None and manifest is not None:
+                chunk_file = str(chunks_dir / f"chunk_{chunk_idx:04d}.mp4")
+                if os.path.exists(chunk_file) and chunk_file in manifest.get("chunks", []):
+                    print(f"[RESUME] Skipping already completed chunk {chunk_idx} ({frames.shape[0]} frames)")
+                    total_processed += frames.shape[0]
+                    del frames
+                    continue
+
             # Calculate progress metrics
             elapsed = time.time() - start_time_glob
-            
             # Speed (fps) - avoid division by zero
             if total_processed > 0 and elapsed > 0:
                 speed_fps = total_processed / elapsed
@@ -787,21 +846,38 @@ def main():
                 spatial_strategy=args.spatial_strategy,
                 memory_policy=args.memory_policy,
                 validate_outputs=not args.no_validate_outputs,
+                resolution=args.resolution,
             )
-            # Initialize Writer on first chunk
+
+            # In resumable mode: write chunk to dedicated checkpoint file
+            if resumable_mode and chunks_dir is not None and manifest is not None:
+                chunk_file = str(chunks_dir / f"chunk_{chunk_idx:04d}.mp4")
+                chunk_writer = VideoWriter(
+                    output_path=chunk_file,
+                    fps=output_fps,
+                    width=output_frames.shape[2],
+                    height=output_frames.shape[1],
+                    quality=args.quality,
+                    audio_path=None
+                )
+                chunk_writer.write(output_frames)
+                chunk_writer.release()
+                if chunk_file not in manifest["chunks"]:
+                    manifest["chunks"].append(chunk_file)
+                manifest["completed_frames"] = total_processed + frames.shape[0]
+                save_resume_manifest(chunks_dir, manifest)
+                total_processed += frames.shape[0]
+                del frames, output_frames
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            # Standard non-resumable mode: initialize Writer on first chunk
             if writer is None:
                 h, w = output_frames.shape[1], output_frames.shape[2]
-                resolved_out = resolve_filename_prefix(args.output, width=w, height=h)
                 suffix = os.path.splitext(resolved_out)[1] or ".mp4"
                 temp_path = resolved_out + ".tmp" + suffix
-                
-                if args.audio and os.path.exists(args.audio):
-                    audio_source = args.audio
-                elif args.keep_audio:
-                    audio_source = args.input
-                else:
-                    audio_source = None
-                    
                 print(f"Output dimensions: {w}x{h}")
                 print(f"Saving output video to: {resolved_out}")
                 writer = VideoWriter(
@@ -812,7 +888,6 @@ def main():
                     quality=args.quality,
                     audio_path=audio_source
                 )
-            
             # Write frames
             writer.write(output_frames)
             total_processed += frames.shape[0]
@@ -833,13 +908,27 @@ def main():
     finally:
         if writer:
             writer.release()
-        if processing_error is None and temp_path and os.path.exists(temp_path) and resolved_out:
-            os.replace(temp_path, resolved_out)
-        elif processing_error is not None and temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+        if resumable_mode and chunks_dir is not None and manifest is not None:
+            if processing_error is None and manifest.get("chunks"):
+                print(f"\n[RESUME] Assembling {len(manifest['chunks'])} chunks losslessly with FFmpeg concat...")
+                assemble_chunks(
+                    manifest["chunks"],
+                    source_video=audio_source,
+                    destination=resolved_out,
+                    fps=output_fps,
+                    keep_audio=args.keep_audio
+                )
+                if not args.keep_temp:
+                    cleanup_chunks(chunks_dir)
+                print(f"[RESUME] Output video successfully assembled to: {resolved_out}")
+        else:
+            if processing_error is None and temp_path and os.path.exists(temp_path) and resolved_out:
+                os.replace(temp_path, resolved_out)
+            elif processing_error is not None and temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
         logger.info(f"Summary: processed {total_processed}/{total_frames_to_process} frames")
     # ==========================================================================
     # Cleanup

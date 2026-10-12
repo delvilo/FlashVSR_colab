@@ -343,5 +343,59 @@ class TestFlashVSRCoreAndTESpeed(unittest.TestCase):
         self.assertNotIn("opencv", content)
         self.assertIn("torchcodec", content)
 
+    def test_resolve_target_resolution(self):
+        from src.processor import resolve_target_resolution
+        w, h, scale = resolve_target_resolution(640, 360, resolution=1080)
+        self.assertEqual((w, h, scale), (1920, 1080, 4))
+
+        w, h, scale = resolve_target_resolution(720, 480, resolution=720)
+        self.assertEqual((w, h, scale), (1080, 720, 2))
+
+        w, h, scale = resolve_target_resolution(1920, 1080, resolution=1440)
+        self.assertEqual((w, h, scale), (2560, 1440, 2))
+
+        w, h, scale = resolve_target_resolution(640, 360, scale=2)
+        self.assertEqual((w, h, scale), (1280, 720, 2))
+
+    def test_resumable_manifest_and_assembly(self):
+        from src.resumable import get_resume_dir, load_resume_manifest, save_resume_manifest, assemble_chunks, cleanup_chunks
+        from cli_main import VideoWriter
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dest_file = os.path.join(td, "final_video.mp4")
+            chunks_dir = get_resume_dir(dest_file)
+            self.assertFalse(os.path.exists(chunks_dir))
+
+            # Manifest test
+            manifest = {"input": "dummy.mp4", "chunks": [], "completed_frames": 0}
+            save_resume_manifest(chunks_dir, manifest)
+            loaded = load_resume_manifest(chunks_dir)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["input"], "dummy.mp4")
+
+            # Generate 2 dummy chunk MP4s
+            c1 = str(chunks_dir / "chunk_0000.mp4")
+            c2 = str(chunks_dir / "chunk_0001.mp4")
+            w1 = VideoWriter(c1, fps=24, width=64, height=64, quality=8)
+            w1.write(torch.rand(3, 64, 64, 3))
+            w1.release()
+
+            w2 = VideoWriter(c2, fps=24, width=64, height=64, quality=8)
+            w2.write(torch.rand(3, 64, 64, 3))
+            w2.release()
+
+            self.assertTrue(os.path.exists(c1))
+            self.assertTrue(os.path.exists(c2))
+
+            # Assemble chunks test
+            ok = assemble_chunks([c1, c2], source_video=None, destination=dest_file, fps=24, keep_audio=False)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.exists(dest_file))
+            self.assertGreater(os.path.getsize(dest_file), 0)
+
+            # Cleanup test
+            cleanup_chunks(chunks_dir)
+            self.assertFalse(os.path.exists(chunks_dir))
+
 if __name__ == '__main__':
     unittest.main()

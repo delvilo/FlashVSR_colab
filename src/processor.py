@@ -339,23 +339,48 @@ def next_8n5(x: int) -> int:
     return ((x - 5 + 7) // 8) * 8 + 5
 
 
-def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128) -> Tuple[int, int, int, int, int, int]:
-    sW = w0 * scale
-    sH = h0 * scale
+def resolve_target_resolution(w0: int, h0: int, resolution: Optional[int] = None, scale: Optional[int] = None) -> Tuple[int, int, int]:
+    """
+    Resolves (target_w, target_h, effective_scale) from input dimensions.
+    When resolution is specified, sets the shortest edge to resolution (e.g. 720, 1080).
+    Automatically picks 2x or 4x model based on scale ratio.
+    """
+    if resolution is not None and resolution > 0:
+        short_edge = min(w0, h0)
+        scale_ratio = resolution / max(short_edge, 1)
+        effective_scale = 2 if scale_ratio <= 2.8 else 4
+        target_w = round(w0 * scale_ratio)
+        target_h = round(h0 * scale_ratio)
+        target_w = target_w - (target_w % 2)
+        target_h = target_h - (target_h % 2)
+        return target_w, target_h, effective_scale
+    else:
+        effective_scale = scale if scale in (2, 4) else 2
+        return w0 * effective_scale, h0 * effective_scale, effective_scale
+
+
+def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128, target_dims: Optional[Tuple[int, int]] = None) -> Tuple[int, int, int, int, int, int]:
+    if target_dims is not None:
+        sW, sH = target_dims
+    else:
+        sW = w0 * scale
+        sH = h0 * scale
     tW = math.ceil(sW / multiple) * multiple
     tH = math.ceil(sH / multiple) * multiple
     pad_left = (tW - sW) // 2
     pad_top = (tH - sH) // 2
     return sW, sH, tW, tH, pad_left, pad_top
 
-
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, pad_left: int, pad_top: int) -> torch.Tensor:
+def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, pad_left: int, pad_top: int, sW: Optional[int] = None, sH: Optional[int] = None) -> torch.Tensor:
     if frame_tensor.dim() == 3:
         frame_tensor = frame_tensor.unsqueeze(0)
     if frame_tensor.shape[1] not in (1, 3, 4) and frame_tensor.shape[-1] in (1, 3, 4):
         frame_tensor = frame_tensor.permute(0, 3, 1, 2)
 
-    upscaled = F.interpolate(frame_tensor, scale_factor=float(scale), mode="bicubic", align_corners=False)
+    if sW is not None and sH is not None:
+        upscaled = F.interpolate(frame_tensor, size=(sH, sW), mode="bicubic", align_corners=False)
+    else:
+        upscaled = F.interpolate(frame_tensor, scale_factor=float(scale), mode="bicubic", align_corners=False)
     _, _, uH, uW = upscaled.shape
     pad_right = max(0, tW - (pad_left + uW))
     pad_bottom = max(0, tH - (pad_top + uH))
@@ -367,17 +392,17 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     return cropped.squeeze(0)
 
 
-def prepare_input_tensor(image_tensor: torch.Tensor, device: Any, scale: int = 4, dtype: torch.dtype = torch.float16):
+def prepare_input_tensor(image_tensor: torch.Tensor, device: Any, scale: int = 4, dtype: torch.dtype = torch.float16, target_dims: Optional[Tuple[int, int]] = None):
     N0, h0, w0, _ = image_tensor.shape
     multiple = 128
-    sW, sH, tW, tH, pad_left, pad_top = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    sW, sH, tW, tH, pad_left, pad_top = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple, target_dims=target_dims)
     F_frames = max(25, largest_8n1_leq(N0 + 4))
 
     frames = []
     for i in range(F_frames):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx]
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH, pad_left=pad_left, pad_top=pad_top).to("cpu", dtype=dtype) * 2.0 - 1.0
+        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH, pad_left=pad_left, pad_top=pad_top, sW=sW, sH=sH).to("cpu", dtype=dtype) * 2.0 - 1.0
         frames.append(tensor_chw)
 
     vid_final = torch.stack(frames, dim=1).unsqueeze(0)  # (1, C, F, H, W)
@@ -492,6 +517,7 @@ def process_chunk(
     budget_controller: Optional[AttentionBudgetController] = None,
     stage_memory: bool = False,
     validate_outputs: bool = True,
+    target_dims: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """
     Processes a temporal chunk of frames.
@@ -508,7 +534,8 @@ def process_chunk(
     else:
         _frames = frames
     # Input tensor preparation
-    LQ, th, tw, F_frames, sH, sW, pad_top, pad_left = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
+    # Input tensor preparation
+    LQ, th, tw, F_frames, sH, sW, pad_top, pad_left = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype, target_dims=target_dims)
     if not isinstance(pipe, FlashVSRTinyLongPipeline):
         LQ = LQ.to(_device)
 
@@ -577,6 +604,8 @@ def flashvsr(
     spatial_strategy: str = "auto",
     memory_policy: str = "auto",
     validate_outputs: bool = True,
+    target_dims: Optional[Tuple[int, int]] = None,
+    resolution: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Main FlashVSR video restoration function with TE-Speed dynamic enhancements.
@@ -584,6 +613,14 @@ def flashvsr(
     clean_vram()
     start_time = time.time()
 
+    # Feature: Automatic short-edge resolution resolution
+    if resolution is not None and resolution > 0:
+        orig_H, orig_W = frames.shape[1], frames.shape[2]
+        target_w, target_h, eff_scale = resolve_target_resolution(orig_W, orig_H, resolution=resolution, scale=scale)
+        target_dims = (target_w, target_h)
+        scale = eff_scale
+        if enable_debug:
+            log(f"Resolution target {resolution}px: scaled to {target_w}x{target_h} (model scale: {scale}x)", message_type="info", icon="📐")
     # Pre-resize if requested
     if 0.0 < resize_factor < 1.0:
         orig_H, orig_W = frames.shape[1], frames.shape[2]
@@ -648,6 +685,7 @@ def flashvsr(
                 budget_controller=budget_ctrl,
                 stage_memory=stage_memory,
                 validate_outputs=validate_outputs,
+                target_dims=target_dims,
             )
 
         # Chunked temporal processing
@@ -676,6 +714,7 @@ def flashvsr(
                 budget_controller=budget_ctrl,
                 stage_memory=stage_memory,
                 validate_outputs=validate_outputs,
+                target_dims=target_dims,
             )
             c_outputs.append(c_out)
             del c_out
