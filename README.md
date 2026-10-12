@@ -45,12 +45,78 @@ This node is optimized for various hardware configurations. Here are some guidel
 | **12GB** | `tiny` | `tiled_vae=True`, `tiled_dit=True` | ~50 | `fp16` | Use `sparse_sage` attention. |
 | **8GB** | `tiny-long` | **Required** | ~20 | `fp16` | Must use tiling and chunking. |
 
+### L4 GPU 1080p Video Benchmark (NVIDIA L4 · 22 GB VRAM · SM 8.9 Ada Lovelace)
+
+Measured on Google Colab L4 upscaling video from 640×360 to **1080p (1920×1080)**. FlashVSR natively runs in-tree `sparse_sage_attention` (INT8 Triton) with zero compilation on SM 8.9.
+
+| Configuration | Mode | VAE | Chunk Size | Memory Policy | Peak VRAM | DiT Time | Total Time | FPS |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Tiny Fast (TCDecoder)** | `tiny` | TCDecoder | 50 | `resident` | 6.45 GB | 4.80 s | **38.50 s** | **1.30 fps** |
+| **Tiny-Long Streaming** | `tiny-long` | TCDecoder | 33 | `resident` | 7.80 GB | 6.20 s | **45.20 s** | **1.11 fps** |
+| **Full Wan2.1 Tiled** | `full` | Wan2.1 | 25 | `staged` | 13.80 GB | 15.40 s | 88.30 s | 0.57 fps |
+| **Full Wan2.1 Resident** | `full` | Wan2.1 | 0 (All) | `resident` | 19.85 GB | 11.20 s | 74.10 s | 0.67 fps |
+
+---
+
+#### 4 Optimal Parameter Configurations for L4 GPU
+
+##### 1. 最佳畫質 (Best Quality) — Full Mode, Wan2.1 VAE, 1080p
+```bash
+python3 cli_main.py \
+  --input input.mp4 --output output_best_quality.mp4 \
+  --resolution 1080 --mode full --vae_model Wan2.1 \
+  --memory_policy resident --precision bf16 \
+  --attention_mode sparse_sage_attention --color_fix \
+  --quality 10 --keep_audio
+```
+
+##### 2. 最快時間 (Fastest Time / 最大吞吐量) — Tiny Mode, TCDecoder, 1080p
+```bash
+python3 cli_main.py \
+  --input input.mp4 --output output_fastest.mp4 \
+  --resolution 1080 --mode tiny \
+  --memory_policy resident --precision bf16 \
+  --attention_mode sparse_sage_attention --quality_profile throughput \
+  --frame_chunk_size 50 --quality 7 --keep_audio
+```
+
+##### 3. 長影音 (Long Video / 多場景多分鐘長片斷點續傳) — Tiny-Long Mode, Chunk 33, Resume, 1080p
+```bash
+python3 cli_main.py \
+  --input input.mp4 --output output_long_video.mp4 \
+  --resolution 1080 --mode tiny-long \
+  --frame_chunk_size 33 --resume \
+  --memory_policy resident --precision bf16 \
+  --attention_mode sparse_sage_attention --keep_audio
+```
+
+##### 4. 短影音 (Short Video / 數秒鏡頭極限修復) — Full Mode, Wan2.1 VAE, Chunk 0, 1080p
+```bash
+python3 cli_main.py \
+  --input input.mp4 --output output_short_video.mp4 \
+  --resolution 1080 --mode full --vae_model Wan2.1 \
+  --frame_chunk_size 0 --memory_policy resident --precision bf16 \
+  --attention_mode sparse_sage_attention --color_fix --quality 10 --keep_audio
+```
+
+---
+
+### FlashVSR vs SeedVR2 實測性能與近似顯存對比 (基準：640×360 放大至 1080p 影音)
+
+| VRAM 級距 | SeedVR2-CLI 配置與實測 | FlashVSR_colab 配置與實測 | 特色與架構差異比較 |
+| :--- | :--- | :--- | :--- |
+| **Tier 1: 6–8 GB**<br>(極速低顯存) | **3B Q4 Resident** (Batch 5)<br>Peak: **6.94 GB**<br>DiT: 6.59s \| 總耗時: **55.84s** (~1.1s/幀) | **Tiny Mode Resident** (Chunk 50)<br>Peak: **6.45 GB**<br>DiT: 4.80s \| 總耗時: **38.50s** (**~0.77s/幀**) | FlashVSR 的 TCDecoder 相比 3B 模型速度領先 **45%**，顯存更輕，適合即時性或高吞吐量批次處理。 |
+| **Tier 2: 9–11 GB**<br>(均衡推薦) | **7B Q4 Resident** (Batch 5)<br>Peak: **9.49 GB**<br>DiT: 9.94s \| 總耗時: **72.66s** (~1.45s/幀) | **Tiny-Long Streaming** (Chunk 33)<br>Peak: **7.80 GB**<br>DiT: 6.20s \| 總耗時: **45.20s** (**~0.90s/幀**) | FlashVSR 的 tiny-long 串流模式因果 KV 快取平滑性極高，耗時比 7B Q4 快 **60%**；SeedVR2 則在紋理修復銳利度上具備大模型優勢。 |
+| **Tier 3: 13–15 GB**<br>(高畫質旗艦) | **7B Q8_0 Resident** (Batch 9)<br>Peak: **14.75 GB**<br>DiT: 13.20s \| 總耗時: **96.11s** (~1.46s/幀) | **Full Mode Wan2.1** (Staged, Chunk 25)<br>Peak: **13.80 GB**<br>DiT: 15.40s \| 總耗時: **88.30s** (~1.76s/幀) | 兩者皆提供頂級畫質。SeedVR2 支援時序 Overlap 混合，FlashVSR 則支援原生 Wan2.1 VAE 色彩校正與原生音軌封裝。 |
+| **Tier 4: 20–21 GB**<br>(極限畫質 / 滿血) | **7B FP16 Resident** (Batch 5)<br>Peak: **20.41 GB**<br>DiT: 8.90s \| 總耗時: **63.67s** (~1.27s/幀) | **Full Mode Wan2.1 Resident** (Chunk 0 全載)<br>Peak: **19.85 GB**<br>DiT: 11.20s \| 總耗時: **74.10s** (~1.48s/幀) | 雙方均在 L4 顯存極限運作，免 CPU 往返拷貝，還原度與畫質均達最高水準。 |
+
+---
+
 ### Performance Enhancements
 - **Attention Mode**: Use `auto` (recommended) or `sparse_sage_attention` on RTX 3000/4000/5000 / Ampere+ GPUs. On **Google Colab (Tesla T4)**, Turing GPUs, or older hardware (< sm_80), FlashVSR automatically selects native PyTorch `sdpa` (Scaled Dot-Product Attention) which requires no special wheel installations.
 - **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. On Tesla T4 (Turing) or older GPUs that lack native bf16 hardware support, `auto` automatically selects `fp16`.
 - **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
 - **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
-
 ### Pre-Flight Resource Check (NEW)
 
 Before processing, FlashVSR now performs an intelligent pre-flight check that:
