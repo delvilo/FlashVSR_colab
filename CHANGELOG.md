@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.1] - 2026-10-13
+
+### 🐛 Bug Fixes & Compatibility
+
+- **Google Colab & Tesla T4 GPU Support**:
+  - **Fixed `requirements.txt`**: Removed incompatible cp313/cu130 prebuilt wheel URLs that broke `pip install -r requirements.txt` on Colab.
+  - **Auto-Detection for T4 / Turing (< sm_80)**: Automatically switches to native PyTorch `sdpa` attention and `fp16` precision on GPUs with compute capability < 8.0 (FlashAttention-2 and SageAttention require sm >= 8.0).
+  - **Implemented `ATTENTION_MODE` in `wan_video_dit.py`**: Properly wired up attention mode resolution and added dense SDPA attention paths for `SelfAttention`.
+  - **Safe Optional Imports**: Made `sparse_sage` and `triton` imports optional with try/except fallbacks.
+  - **Fixed Unpacking in `DiTBlock.forward`**: Handled single-tensor return when `is_stream=False`.
+  - **Fixed `kv_len` NoneType Check in `SelfAttention`**: Added guard for `kv_len is not None`.
+  - **Safe Prompt Tensor Deserialization**: Loaded `posi_prompt.pth` on CPU first before device placement to protect non-bf16 devices like T4.
+  - **Fixed Pipeline `cfg_scale` Default**: Aligned signature default (`1.0`) with assertion.
+  - **Standalone Node Import**: Added fallback mocks for `folder_paths` and `comfy.utils` when running outside ComfyUI.
+
 ## [1.3.0] - 2026-02-03
 
 ### 🚀 New Features

@@ -244,7 +244,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         if context_tensor is None:
             if prompt_path is None:
                 raise ValueError("init_cross_kv: 需要提供 prompt_path 或 context_tensor 其一")
-            ctx = torch.load(prompt_path, map_location=self.device)
+            ctx = torch.load(prompt_path, map_location="cpu")
         else:
             ctx = context_tensor
 
@@ -310,7 +310,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         height=480,
         width=832,
         num_frames=81,
-        cfg_scale=5.0,
+        cfg_scale=1.0,
         num_inference_steps=50,
         sigma_shift=5.0,
         tiled=True,
@@ -330,6 +330,8 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         unload_dit = False,
         force_offload = False,
         enable_debug_logging = False,
+        budget_controller = None,
+        stage_memory = False,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -362,7 +364,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
-        process_total_num = (num_frames - 1) // 8 - 2
+        process_total_num = max(1, (num_frames - 1) // 8 - 2)
         is_stream = True
         
         if self.prompt_emb_posi['stats'] == "offload":
@@ -433,8 +435,15 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
-                        
-                # 推理（无 motion_controller / vace）
+                chunk_topk_ratio = topk_ratio
+                chunk_kv_ratio = kv_ratio
+                chunk_local_range = local_range
+                if budget_controller is not None:
+                    chunk_topk_ratio, chunk_kv_ratio, chunk_local_range = budget_controller.values_for(
+                        cur_process_idx, topk_ratio, kv_ratio, local_range
+                    )
+
+                # 推理（带动态预算控制）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
                     x=cur_latents,
@@ -447,12 +456,12 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     is_stream=is_stream,
                     pre_cache_k=pre_cache_k,
                     pre_cache_v=pre_cache_v,
-                    topk_ratio=topk_ratio,
-                    kv_ratio=kv_ratio,
+                    topk_ratio=chunk_topk_ratio,
+                    kv_ratio=chunk_kv_ratio,
                     cur_process_idx=cur_process_idx,
                     t_mod=self.t_mod,
                     t=self.t,
-                    local_range = local_range,
+                    local_range = chunk_local_range,
                 )
 
                 # 更新 latent

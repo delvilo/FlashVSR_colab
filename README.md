@@ -46,8 +46,8 @@ This node is optimized for various hardware configurations. Here are some guidel
 | **8GB** | `tiny-long` | **Required** | ~20 | `fp16` | Must use tiling and chunking. |
 
 ### Performance Enhancements
-- **Attention Mode**: Use `sparse_sage_attention` for the best balance of speed and memory. `flash_attention_2` is faster but requires specific hardware/installation.
-- **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. It is faster and preserves dynamic range better than `fp16`.
+- **Attention Mode**: Use `auto` (recommended) or `sparse_sage_attention` on RTX 3000/4000/5000 / Ampere+ GPUs. On **Google Colab (Tesla T4)**, Turing GPUs, or older hardware (< sm_80), FlashVSR automatically selects native PyTorch `sdpa` (Scaled Dot-Product Attention) which requires no special wheel installations.
+- **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. On Tesla T4 (Turing) or older GPUs that lack native bf16 hardware support, `auto` automatically selects `fp16`.
 - **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
 - **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
 
@@ -292,13 +292,10 @@ git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
 python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
 ```
 
-> 📢 **Turing architecture or older GPUs (GTX 16 series, RTX 20 series, and earlier)**: Install `triton<3.3.0`:
-> ```bash
-> # Windows
-> python -m pip install -U triton-windows<3.3.0
-> # Linux
-> python -m pip install -U triton<3.3.0
-> ```
+> 📢 **Google Colab & Tesla T4 (Turing, compute capability 7.5)**:
+> - Tesla T4 does not support FlashAttention-2 or SageAttention (requires sm >= 8.0). FlashVSR automatically detects T4 GPUs and falls back to PyTorch native `sdpa` attention and `fp16` precision.
+> - Simply run `pip install -r requirements.txt` without needing custom wheels.
+> - Recommended settings for Colab T4 (15GB VRAM): `mode="tiny"`, `precision="auto"` (or `fp16`), `attention_mode="auto"` (or `sdpa`), `tiled_vae=True`, `tiled_dit=True`.
 
 ### Step 2: Download Models
 

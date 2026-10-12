@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-FlashVSR_Stable"
 description = "ComfyUI-FlashVSR_Stable official ComfyUI integration: High-performance Video Super Resolution for ComfyUI with VRAM optimization."
-version = "1.3.0"
+version = "1.3.1"
 authors = [
     {name = "naxci1"},
 ]

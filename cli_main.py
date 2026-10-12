@@ -123,9 +123,9 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--attention_mode',
         type=str,
-        choices=['sparse_sage_attention', 'block_sparse_attention', 'flash_attention_2', 'sdpa'],
-        default='sparse_sage_attention',
-        help='Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention. (default: sparse_sage_attention)'
+        choices=['auto', 'sdpa', 'sparse_sage_attention', 'block_sparse_attention', 'flash_attention_2'],
+        default='auto',
+        help='Attention mechanism backend. "auto" selects optimal for GPU (sdpa for T4/Colab, sparse_sage for RTX 30/40/50). (default: auto)'
     )
 
     # ==========================================================================
@@ -233,6 +233,47 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         default=1.0,
         help='Resize input frames before processing (0.1-1.0). Set to 0.5 for large 1080p+ videos. (default: 1.0)'
     )
+    # ==========================================================================
+    # TE-Speed Optimization parameters (Features 1, 2, 3, 5, 6)
+    # ==========================================================================
+    parser.add_argument(
+        '--quality_profile',
+        type=str,
+        choices=['detail', 'balanced', 'throughput'],
+        default='balanced',
+        help='TE-Speed dynamic attention budget profile (default: balanced)'
+    )
+    parser.add_argument(
+        '--motion_intensity',
+        type=float,
+        default=1.0,
+        help='Motion sensitivity multiplier for dynamic budget (default: 1.0)'
+    )
+    parser.add_argument(
+        '--spatial_strategy',
+        type=str,
+        choices=['auto', 'full_frame', 'adaptive_tiles'],
+        default='auto',
+        help='Spatial partitioning strategy: auto (dynamic), full_frame, or adaptive_tiles (default: auto)'
+    )
+    parser.add_argument(
+        '--memory_policy',
+        type=str,
+        choices=['auto', 'staged', 'resident'],
+        default='auto',
+        help='VRAM memory policy: auto (auto-detect based on VRAM/size), staged (swap DiT/VAE to avoid OOM), or resident (default: auto)'
+    )
+    parser.add_argument(
+        '--audio',
+        type=str,
+        default=None,
+        help='Audio file path to mux into final video. (default: extract from input video if present)'
+    )
+    parser.add_argument(
+        '--no_validate_outputs',
+        action='store_true',
+        help='Disable NaN/Inf numerical sanity checks.'
+    )
 
     # ==========================================================================
     # Video I/O parameters
@@ -243,17 +284,13 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         default=None,
         help='Output video FPS. If not specified, uses input video FPS.'
     )
+    # Output quality (replaces --crf/--codec)
     parser.add_argument(
-        '--codec',
-        type=str,
-        default='libx264',
-        help='Video codec for output (e.g., libx264, libx265, h264_nvenc). (default: libx264)'
-    )
-    parser.add_argument(
-        '--crf',
+        '--quality',
         type=int,
-        default=18,
-        help='Constant Rate Factor for quality (0-51, lower = better quality). (default: 18)'
+        default=8,
+        metavar='Q',
+        help='Output video quality 0–10 (10=best, maps to CRF/CQ). Default: 8'
     )
     parser.add_argument(
         '--start_frame',
@@ -276,6 +313,26 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         type=str,
         default=None,
         help='Custom path to FlashVSR models directory. If not set, uses ComfyUI default or ./models'
+    )
+    # Audio
+    parser.add_argument(
+        '--keep_audio',
+        action='store_true',
+        default=False,
+        help='Copy audio from input video to output. Requires FFmpeg.'
+    )
+    # Logging
+    parser.add_argument(
+        '--log_level',
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Log verbosity (default: INFO)'
+    )
+    parser.add_argument(
+        '--log_file',
+        type=str,
+        default=None,
+        help='Append JSONL structured logs to this file.'
     )
 
     return parser.parse_args()
@@ -370,58 +427,115 @@ class VideoWriter:
     """
     Incremental video writer.
     """
-    def __init__(self, output_path, fps, width, height, codec='libx264', crf=18):
-        import cv2
+    def __init__(self, output_path, fps, width, height, quality=8, audio_path=None, **kwargs):
         self.output_path = output_path
-        self.width = width
-        self.height = height
-        self.codec = codec
-        self.crf = crf
+        self.width = width - (width % 2)
+        self.height = height - (height % 2)
+        self.fps = fps
+        self.audio_path = audio_path
+        self.is_ffmpeg = False
+        self.proc = None
+        self.out = None
         
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
-        # Determine codec fourcc
-        if codec in ['libx264', 'h264']:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4v is safer for general compatibility without ffmpeg specifically
-        elif codec in ['libx265', 'hevc']:
-            fourcc = cv2.VideoWriter_fourcc(*'hvc1')
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        import subprocess
+        from src.media import MediaTools, MediaError
+        try:
+            media = MediaTools()
+            ffmpeg_bin = getattr(media, "ffmpeg", None)
+            if not ffmpeg_bin:
+                ffmpeg_bin = MediaTools.find_ffmpeg() if hasattr(MediaTools, "find_ffmpeg") else "ffmpeg"
+            crf = int(26 - quality * 0.6)
+            suffix = os.path.splitext(output_path)[1].lower()
+            use_hevc = media.nvenc_works(0, quality) if suffix in {'.mp4', '.mov', '.mkv'} else False
+            use_h264nvenc = media._h264_nvenc_works(0) if suffix == '.avi' else False
             
-        self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        if not self.out.isOpened():
-             print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
-             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-             self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-             if not self.out.isOpened():
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{self.width}x{self.height}",
+                "-r", str(self.fps),
+                "-i", "-",
+            ]
+            has_audio = False
+            if self.audio_path and os.path.exists(self.audio_path):
+                try:
+                    has_audio = media.has_audio(self.audio_path)
+                except Exception:
+                    has_audio = False
+                if has_audio:
+                    cmd += ["-i", self.audio_path]
+            
+            if use_hevc:
+                if hasattr(media, "hevc_nvenc_arguments"):
+                    cmd += list(media.hevc_nvenc_arguments(quality, 0))
+                else:
+                    cmd += ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", str(crf), "-pix_fmt", "yuv420p"]
+            elif use_h264nvenc:
+                cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", str(crf), "-pix_fmt", "yuv420p"]
+            else:
+                cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+            
+            if suffix in {'.mp4', '.mov'}:
+                cmd += ["-movflags", "+faststart"]
+                
+            if has_audio:
+                cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+                
+            cmd.append(self.output_path)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.is_ffmpeg = True
+        except Exception:
+            import cv2
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.out = cv2.VideoWriter(output_path, fourcc, fps, (self.width, self.height))
+            if not self.out.isOpened():
                 raise RuntimeError(f"Failed to create output video: {output_path}")
-
     def write(self, frames_tensor):
         import torch
         import numpy as np
         import cv2
         
-        # Convert tensor to numpy
-        if isinstance(frames_tensor, torch.Tensor):
-            frames_np = frames_tensor.cpu().numpy()
-        else:
-            frames_np = frames_tensor
-        
-        # Ensure values are in [0, 1] and convert to uint8
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_np = (frames_np * 255).astype(np.uint8)
-        
-        n_frames = frames_np.shape[0]
-        
-        for i in range(n_frames):
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
-            self.out.write(frame_bgr)
-            
+        if self.is_ffmpeg and self.proc:
+            if isinstance(frames_tensor, torch.Tensor):
+                f_cpu = frames_tensor.detach().cpu()
+                if f_cpu.shape[1] in (1, 3, 4) and f_cpu.shape[-1] not in (1, 3, 4):
+                    f_cpu = f_cpu.permute(0, 2, 3, 1)
+                if f_cpu.is_floating_point():
+                    if f_cpu.min() < 0.0:
+                        f_cpu = (f_cpu + 1.0) * 127.5
+                    elif f_cpu.max() <= 1.0:
+                        f_cpu = f_cpu * 255.0
+                    f_bytes = f_cpu.clamp(0, 255).byte().numpy().tobytes()
+                else:
+                    f_bytes = f_cpu.numpy().tobytes()
+            else:
+                f_np = np.asarray(frames_tensor)
+                if f_np.dtype != np.uint8:
+                    if f_np.min() < 0.0:
+                        f_np = (f_np + 1.0) * 127.5
+                    elif f_np.max() <= 1.0:
+                        f_np = f_np * 255.0
+                    f_np = np.clip(f_np, 0, 255).astype(np.uint8)
+                f_bytes = f_np.tobytes()
+            self.proc.stdin.write(f_bytes)
+        elif self.out:
+            import cv2
+            frames_np = frames_tensor.cpu().numpy() if isinstance(frames_tensor, torch.Tensor) else frames_tensor
+            frames_np = np.clip(frames_np, 0.0, 1.0)
+            frames_np = (frames_np * 255).astype(np.uint8)
+            for i in range(frames_np.shape[0]):
+                frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
+                self.out.write(frame_bgr)
+
     def release(self):
-        if self.out:
+        if self.is_ffmpeg and self.proc:
+            self.proc.stdin.close()
+            self.proc.wait()
+        elif self.out:
             self.out.release()
 
 def format_time(seconds):
@@ -439,6 +553,9 @@ def format_time(seconds):
 
 def main():
     args = parse_args()
+    from src.flashvsr_log import configure_logging, get_logger
+    configure_logging(args.log_level, args.log_file)
+    logger = get_logger("flashvsr")
 
     # Safety check: ensure output file does not already exist
     if os.path.exists(args.output):
@@ -463,29 +580,15 @@ def main():
     # Setup environment and imports
     # ==========================================================================
     
-    # Mock ComfyUI modules for standalone CLI operation
-    from unittest.mock import MagicMock
-    
-    # Create mock folder_paths module
-    folder_paths_mock = MagicMock()
-    if args.models_dir:
-        folder_paths_mock.models_dir = args.models_dir
-    else:
-        # Default to ./models or ComfyUI default
-        folder_paths_mock.models_dir = os.path.join(os.path.dirname(__file__), "models")
-    folder_paths_mock.get_filename_list = MagicMock(return_value=[])
-    sys.modules['folder_paths'] = folder_paths_mock
-    
-    # Create mock comfy modules
-    comfy_mock = MagicMock()
-    comfy_utils_mock = MagicMock()
-    comfy_utils_mock.ProgressBar = MagicMock()
-    sys.modules['comfy'] = comfy_mock
-    sys.modules['comfy.utils'] = comfy_utils_mock
-    
-    # Now import FlashVSR modules
+    # Now import FlashVSR modules directly
     import torch
-    
+    from src.processor import (
+        init_pipeline, flashvsr, log,
+        VAE_MODEL_OPTIONS, VAE_MODEL_MAP
+    )
+    from src.models import wan_video_dit
+    from src.te_speed import resolve_filename_prefix
+
     # Set device
     device = args.device
     if device == "auto":
@@ -498,12 +601,7 @@ def main():
     
     print(f"Device: {device}")
     
-    # Import FlashVSR modules after mocking
-    from nodes import (
-        init_pipeline, flashvsr, log,
-        VAE_MODEL_OPTIONS, VAE_MODEL_MAP
-    )
-    from src.models import wan_video_dit
+
     
     # ==========================================================================
     # Load input video (Lazily)
@@ -535,7 +633,15 @@ def main():
     # ==========================================================================
     print("\nInitializing FlashVSR pipeline...")
     
-    # Set attention mode
+    # Set attention mode with sm < 8.0 (T4 / Colab) fallback
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            cap = torch.cuda.get_device_capability(device)
+            if cap < (8, 0) and args.attention_mode in ["sparse_sage_attention", "flash_attention_2", "block_sparse_attention"]:
+                print(f"[FlashVSR] Device {device} (compute capability {cap[0]}.{cap[1]} < 8.0) does not support '{args.attention_mode}'. Automatically switching to 'sdpa'.")
+                args.attention_mode = "sdpa"
+        except Exception:
+            pass
     wan_video_dit.ATTENTION_MODE = args.attention_mode
     
     # Determine dtype
@@ -572,7 +678,9 @@ def main():
     writer = None
     total_processed = 0
     start_time_glob = 0
-    
+    resolved_out = None
+    temp_path = None
+    processing_error = None
     try:
         import time
         start_time_glob = time.time()
@@ -616,25 +724,40 @@ def main():
                 kv_ratio=args.kv_ratio,
                 local_range=args.local_range,
                 seed=args.seed,
-                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                force_offload=keep_models_on_cpu,
                 enable_debug=args.enable_debug,
-                chunk_size=0, # Already chunked
+                chunk_size=0,
                 resize_factor=args.resize_factor,
-                mode=args.mode
+                mode=args.mode,
+                quality_profile=args.quality_profile,
+                motion_intensity=args.motion_intensity,
+                spatial_strategy=args.spatial_strategy,
+                memory_policy=args.memory_policy,
+                validate_outputs=not args.no_validate_outputs,
             )
-            
             # Initialize Writer on first chunk
             if writer is None:
                 h, w = output_frames.shape[1], output_frames.shape[2]
+                resolved_out = resolve_filename_prefix(args.output, width=w, height=h)
+                suffix = os.path.splitext(resolved_out)[1] or ".mp4"
+                temp_path = resolved_out + ".tmp" + suffix
+                
+                if args.audio and os.path.exists(args.audio):
+                    audio_source = args.audio
+                elif args.keep_audio:
+                    audio_source = args.input
+                else:
+                    audio_source = None
+                    
                 print(f"Output dimensions: {w}x{h}")
-                print(f"Saving output video to: {args.output}")
+                print(f"Saving output video to: {resolved_out}")
                 writer = VideoWriter(
-                    output_path=args.output,
+                    output_path=temp_path,
                     fps=output_fps,
                     width=w,
                     height=h,
-                    codec=args.codec,
-                    crf=args.crf
+                    quality=args.quality,
+                    audio_path=audio_source
                 )
             
             # Write frames
@@ -650,13 +773,21 @@ def main():
     except StopIteration:
         pass
     except Exception as e:
+        processing_error = e
         print(f"\nError during processing: {e}")
         import traceback
         traceback.print_exc()
     finally:
         if writer:
             writer.release()
-    
+        if processing_error is None and temp_path and os.path.exists(temp_path) and resolved_out:
+            os.replace(temp_path, resolved_out)
+        elif processing_error is not None and temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        logger.info(f"Summary: processed {total_processed}/{total_frames_to_process} frames")
     # ==========================================================================
     # Cleanup
     # ==========================================================================

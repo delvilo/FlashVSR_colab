@@ -1,3 +1,6 @@
-from .models import *
-from .pipelines import *
-from .schedulers import *
+try:
+    from .models import *
+    from .pipelines import *
+    from .schedulers import *
+except (ImportError, ModuleNotFoundError):
+    pass

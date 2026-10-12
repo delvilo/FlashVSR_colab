@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+models/
+*.ckpt
+*.safetensors
+*.pth
 # C extensions
 *.so
 

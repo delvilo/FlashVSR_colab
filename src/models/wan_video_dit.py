@@ -12,33 +12,112 @@ from .utils import hash_state_dict_keys
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError, Exception):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError, Exception):
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
     from sageattention import sageattn
     SAGE_ATTN_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, ModuleNotFoundError, Exception):
     SAGE_ATTN_AVAILABLE = False
 
 try:
     from block_sparse_attn import block_sparse_attn_func
     BLOCK_ATTN_AVAILABLE = True
-except:
+except Exception:
     BLOCK_ATTN_AVAILABLE = False
 
-from .sparse_sage.core import sparse_sageattn
+try:
+    from .sparse_sage.core import sparse_sageattn
+    SPARSE_SAGE_AVAILABLE = True
+except Exception:
+    SPARSE_SAGE_AVAILABLE = False
+    sparse_sageattn = None
+
 from PIL import Image
 import numpy as np
 
 USE_BLOCK_ATTN = False
+ATTENTION_MODE = "auto"
 
+def is_sm80_or_newer(device=None) -> bool:
+    """Check if device is an NVIDIA GPU with compute capability >= 8.0 (Ampere+)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if device is not None:
+            if isinstance(device, torch.device):
+                if device.type != 'cuda':
+                    return False
+                idx = device.index if device.index is not None else torch.cuda.current_device()
+            elif isinstance(device, str):
+                if not device.startswith('cuda'):
+                    return False
+                idx = int(device.split(':')[1]) if ':' in device else torch.cuda.current_device()
+            elif isinstance(device, int):
+                idx = device
+            else:
+                idx = torch.cuda.current_device()
+        else:
+            idx = torch.cuda.current_device()
+        cap = torch.cuda.get_device_capability(idx)
+        return cap >= (8, 0)
+    except Exception:
+        return False
+
+def get_effective_attention_mode(device=None) -> str:
+    """
+    Resolve the effective attention mode based on user setting, GPU architecture,
+    and installed libraries. Turing/T4 (compute capability 7.5) and older GPUs,
+    as well as CPU/MPS, fall back to native PyTorch SDPA.
+    """
+    mode = getattr(wan_video_dit, 'ATTENTION_MODE', 'auto') if 'wan_video_dit' in globals() else ATTENTION_MODE
+    if mode is None:
+        mode = 'auto'
+    mode = str(mode).lower()
+
+    if mode in ['sparse_sage', 'sparse_sage_attention']:
+        normalized = 'sparse_sage_attention'
+    elif mode in ['block_sparse', 'block_sparse_attention']:
+        normalized = 'block_sparse_attention'
+    elif mode in ['flash_attention', 'flash_attention_2', 'flash_attn']:
+        normalized = 'flash_attention_2'
+    elif mode in ['sdpa', 'torch_sdpa']:
+        normalized = 'sdpa'
+    else:
+        normalized = 'auto'
+
+    sm80 = is_sm80_or_newer(device)
+
+    if normalized == 'auto':
+        if sm80 and SPARSE_SAGE_AVAILABLE:
+            return 'sparse_sage_attention'
+        elif sm80 and (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+            return 'flash_attention_2'
+        return 'sdpa'
+
+    if normalized == 'sparse_sage_attention':
+        if not sm80 or not SPARSE_SAGE_AVAILABLE:
+            return 'sdpa'
+        return 'sparse_sage_attention'
+
+    if normalized == 'block_sparse_attention':
+        if not sm80 or not BLOCK_ATTN_AVAILABLE:
+            return 'sdpa'
+        return 'block_sparse_attention'
+
+    if normalized == 'flash_attention_2':
+        if not sm80 or (not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE):
+            return 'sdpa'
+        return 'flash_attention_2'
+
+    return 'sdpa'
 # ----------------------------
 # Local / window masks
 # ----------------------------
@@ -221,28 +300,25 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # Attention kernels
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
-    if attention_mask is not None:
+    effective_mode = get_effective_attention_mode(q.device)
+
+    if attention_mask is not None and effective_mode in ["sparse_sage_attention", "block_sparse_attention"]:
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
-        else:
-            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-        head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
-        streaming_info = None
-        base_blockmask = attention_mask
-        max_seqlen_q_ = seqlen
-        max_seqlen_k_ = seqlen_kv
-        p_dropout = 0.0
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE and effective_mode == "block_sparse_attention":
+            q_in = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
+            k_in = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
+            v_in = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+            cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
+            head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
+            streaming_info = None
+            base_blockmask = attention_mask
+            max_seqlen_q_ = seqlen
+            max_seqlen_k_ = seqlen_kv
+            p_dropout = 0.0
             x = block_sparse_attn_func(
-                q, k, v,
+                q_in, k_in, v_in,
                 cu_seqlens_q, cu_seqlens_k,
                 head_mask_type,
                 streaming_info,
@@ -256,47 +332,51 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 return_attn_probs=False,
             ).unsqueeze(0)
             x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-        else:
-            x = sparse_sageattn(
-                q, k, v,
-                mask_id=base_blockmask.to(torch.int8),
-                is_causal=False,
-                tensor_layout="HND"
-            )
-            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif compatibility_mode:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn_interface.flash_attn_func(q, k, v)
-        if isinstance(x, tuple):
-            x = x[0]
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+            return x
+        elif SPARSE_SAGE_AVAILABLE and sparse_sageattn is not None:
+            try:
+                q_in = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+                k_in = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+                v_in = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+                base_blockmask = attention_mask
+                x = sparse_sageattn(
+                    q_in, k_in, v_in,
+                    mask_id=base_blockmask.to(torch.int8),
+                    is_causal=False,
+                    tensor_layout="HND"
+                )
+                x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+                return x
+            except Exception:
+                # Fall back to SDPA on runtime error
+                pass
+
+    if not compatibility_mode and effective_mode == "flash_attention_2":
+        if FLASH_ATTN_3_AVAILABLE:
+            q_in = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k_in = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v_in = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn_interface.flash_attn_func(q_in, k_in, v_in)
+            if isinstance(x, tuple):
+                x = x[0]
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            return x
+        elif FLASH_ATTN_2_AVAILABLE:
+            q_in = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k_in = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v_in = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q_in, k_in, v_in)
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            return x
+
+    # Native PyTorch SDPA (works universally across all CUDA GPUs, Apple MPS, and CPU)
+    q_in = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k_in = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v_in = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    x = F.scaled_dot_product_attention(q_in, k_in, v_in)
+    x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
+
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
@@ -423,16 +503,21 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+        effective_attn = get_effective_attention_mode(k_w.device)
+        if effective_attn == "block_sparse_attention" and USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
             attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
-        else:
+            x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+        elif effective_attn == "sparse_sage_attention" and SPARSE_SAGE_AVAILABLE and sparse_sageattn is not None:
             attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+        else:
+            # Dense attention via SDPA (or FlashAttention dense) without unnecessary draft mask generation
+            x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask=None)
 
-        x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
         cur_block_n, cur_block_s, _ = k_w.shape
         cache_num = cur_block_n // one_len
-        if cache_num > kv_len:
+        if kv_len is not None and cache_num > kv_len:
             cache_k = k_w[one_len:, :, :]
             cache_v = v_w[one_len:, :, :]
         else:
@@ -527,10 +612,18 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
-            input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
-            kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
-            pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
+        if is_stream:
+            self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
+                input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
+                kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
+                pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range=local_range)
+        else:
+            self_attn_output = self.self_attn(
+                input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
+                kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
+                pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range=local_range)
+            self_attn_cache_k, self_attn_cache_v = None, None
+
 
         x = self.gate(x, gate_msa, self_attn_output)
         x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)

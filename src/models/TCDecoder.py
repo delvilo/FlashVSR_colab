@@ -295,10 +295,10 @@ class DotDict(dict):
     __setattr__ = dict.__setitem__
 
 class TAEW2_1DiffusersWrapper(nn.Module):
-    def __init__(self, pretrained_path=None, channels = [256, 128, 64, 64]):
+    def __init__(self, pretrained_path=None, channels = [256, 128, 64, 64], dtype=torch.float16, device="cuda"):
         super().__init__()
-        self.dtype = torch.bfloat16
-        self.device = "cuda"
+        self.dtype = dtype
+        self.device = device
         self.taehv = TAEHV(pretrained_path, channels = channels).to(self.dtype)
         self.temperal_downsample = [True, True, False]  # [sic]
         self.config = DotDict(scaling_factor=1.0, latents_mean=torch.zeros(16), z_dim=16, latents_std=torch.ones(16))
@@ -320,7 +320,7 @@ class TAEW2_1DiffusersWrapper(nn.Module):
 
 def build_tcdecoder(new_channels = [512, 256, 128, 128],
                                   device="cuda",
-                                  dtype=torch.bfloat16,
+                                  dtype=torch.float16,
                                   new_latent_channels=None):
     """
     构建“更宽”的 decoder；深度增强（IdentityConv2d+ReLU）已在 TAEHV 内部完成。
