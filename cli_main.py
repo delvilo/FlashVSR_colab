@@ -19,7 +19,8 @@ import argparse
 import os
 import sys
 import gc
-
+import torch
+import numpy as np
 # =============================================================================
 # CLI argument parsing - EXHAUSTIVE mapping from ComfyUI node INPUT_TYPES
 # =============================================================================
@@ -346,86 +347,157 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
 # Video I/O utilities (Stream based)
 # =============================================================================
 
+try:
+    from torchcodec.decoders import VideoDecoder
+    TORCHCODEC_AVAILABLE = True
+except (ImportError, OSError):
+    TORCHCODEC_AVAILABLE = False
+
+
 class VideoReader:
     """
-    Iterator that reads video frames in chunks to save memory.
+    High-performance video reader powered by TorchCodec with pure FFmpeg pipe streaming fallback.
+    Zero OpenCV dependency.
     """
     def __init__(self, video_path, start_frame=0, end_frame=-1, chunk_size=0):
-        import cv2
         self.video_path = video_path
         self.start_frame = start_frame
         self.end_frame = end_frame
         self.chunk_size = chunk_size
+        self.decoder = None
+        self.proc = None
         
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Input video not found: {video_path}")
 
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Failed to open video: {video_path}")
+        # 1. Try TorchCodec first (native tensor decoding)
+        if TORCHCODEC_AVAILABLE:
+            try:
+                self.decoder = VideoDecoder(video_path)
+                meta = self.decoder.metadata
+                self.width = int(meta.width)
+                self.height = int(meta.height)
+                self.fps = float(meta.average_fps_from_header or 30.0)
+                self.total_frames = int(meta.num_frames_from_header or len(self.decoder))
+            except Exception:
+                self.decoder = None
 
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
+        # 2. Pure FFmpeg pipe fallback (zero OpenCV)
+        if self.decoder is None:
+            from src.media import MediaTools
+            media = MediaTools()
+            info = media.probe(video_path)
+            v_stream = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+            if not v_stream:
+                raise RuntimeError(f"No video stream found in: {video_path}")
+            self.width = int(v_stream.get("width", 0))
+            self.height = int(v_stream.get("height", 0))
+            self.total_frames = int(v_stream.get("nb_frames") or 0)
+            if self.total_frames == 0:
+                dur = float(v_stream.get("duration") or info.get("format", {}).get("duration", 0) or 0)
+                from fractions import Fraction
+                r_fps = float(Fraction(v_stream.get("avg_frame_rate", "30/1"))) if v_stream.get("avg_frame_rate") else 30.0
+                self.total_frames = round(dur * r_fps) if dur > 0 else 0
+            avg_fps = v_stream.get("avg_frame_rate", "30/1")
+            try:
+                from fractions import Fraction
+                self.fps = float(Fraction(avg_fps)) if avg_fps else 30.0
+            except Exception:
+                self.fps = 30.0
+
         # Adjust end_frame
         if self.end_frame < 0 or self.end_frame > self.total_frames:
             self.end_frame = self.total_frames
             
-        if self.start_frame >= self.total_frames:
+        if self.start_frame >= self.total_frames and self.total_frames > 0:
             print(f"Warning: Start frame {self.start_frame} is beyond total frames {self.total_frames}.")
-            self.end_frame = self.start_frame # Nothing to process
+            self.end_frame = self.start_frame
 
         self.current_frame = self.start_frame
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.frame_bytes = self.width * self.height * 3
 
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.current_frame >= self.end_frame:
-            self.cap.release()
+            self.release()
             raise StopIteration
 
-        import torch
-        import numpy as np
-        import cv2
-
-        frames = []
         frames_to_read = self.chunk_size if self.chunk_size > 0 else (self.end_frame - self.current_frame)
-        
-        # Ensure we don't read past end_frame
         frames_to_read = min(frames_to_read, self.end_frame - self.current_frame)
         
         if frames_to_read <= 0:
-            self.cap.release()
+            self.release()
             raise StopIteration
 
-        for _ in range(frames_to_read):
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            
-            # Convert BGR to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Normalize to [0, 1]
-            frame_normalized = frame_rgb.astype(np.float32) / 255.0
-            frames.append(frame_normalized)
-            self.current_frame += 1
+        target_start = self.current_frame
+        target_end = target_start + frames_to_read
 
-        if not frames:
-            self.cap.release()
+        # Path A: TorchCodec direct zero-copy tensor slicing
+        if self.decoder is not None:
+            try:
+                # TorchCodec outputs [N, C, H, W] uint8
+                # FlashVSR pipeline expects [N, H, W, C] float32 in [0, 1]
+                frame_batch = self.decoder.get_frames_in_range(target_start, target_end).data
+                tensor_out = frame_batch.permute(0, 2, 3, 1).float() / 255.0
+                self.current_frame = target_end
+                return tensor_out.contiguous()
+            except Exception:
+                # Fallback to FFmpeg if range error occurs
+                pass
+
+        # Path B: Pure FFmpeg pipe streaming
+        import subprocess
+        import numpy as np
+        from src.media import MediaTools
+        
+        if self.proc is None:
+            ffmpeg_bin = MediaTools().ffmpeg
+            cmd = [
+                ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
+            ]
+            if target_start > 0:
+                cmd += ["-ss", str(target_start / max(self.fps, 1.0))]
+            cmd += [
+                "-i", self.video_path,
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+            ]
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        bytes_needed = frames_to_read * self.frame_bytes
+        raw_bytes = self.proc.stdout.read(bytes_needed)
+        actual_frames = len(raw_bytes) // self.frame_bytes
+        
+        if actual_frames <= 0:
+            self.release()
             raise StopIteration
 
-        # Stack frames into tensor: (N, H, W, C)
-        frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
-        return frames_tensor
+        np_arr = np.frombuffer(raw_bytes[:actual_frames * self.frame_bytes], dtype=np.uint8).reshape((actual_frames, self.height, self.width, 3)).copy()
+        self.current_frame += actual_frames
+        return (torch.from_numpy(np_arr).float() / 255.0).contiguous()
+
+    def release(self):
+        self.decoder = None
+        if self.proc:
+            try:
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+                if self.proc.stderr:
+                    self.proc.stderr.close()
+                self.proc.wait()
+            except Exception:
+                pass
+            self.proc = None
 
     def get_info(self):
         return self.fps, self.total_frames
 
+
 class VideoWriter:
     """
-    Incremental video writer.
+    Incremental video writer powered by FFmpeg (HEVC NVENC / libx264).
+    Zero OpenCV dependency.
     """
     def __init__(self, output_path, fps, width, height, quality=8, audio_path=None, **kwargs):
         self.output_path = output_path
@@ -433,73 +505,58 @@ class VideoWriter:
         self.height = height - (height % 2)
         self.fps = fps
         self.audio_path = audio_path
-        self.is_ffmpeg = False
         self.proc = None
-        self.out = None
         
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
         import subprocess
         from src.media import MediaTools, MediaError
-        try:
-            media = MediaTools()
-            ffmpeg_bin = getattr(media, "ffmpeg", None)
-            if not ffmpeg_bin:
-                ffmpeg_bin = MediaTools.find_ffmpeg() if hasattr(MediaTools, "find_ffmpeg") else "ffmpeg"
-            crf = int(26 - quality * 0.6)
-            suffix = os.path.splitext(output_path)[1].lower()
-            use_hevc = media.nvenc_works(0, quality) if suffix in {'.mp4', '.mov', '.mkv'} else False
-            use_h264nvenc = media._h264_nvenc_works(0) if suffix == '.avi' else False
-            
-            cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-f", "rawvideo",
-                "-pix_fmt", "rgb24",
-                "-s", f"{self.width}x{self.height}",
-                "-r", str(self.fps),
-                "-i", "-",
-            ]
-            has_audio = False
-            if self.audio_path and os.path.exists(self.audio_path):
-                try:
-                    has_audio = media.has_audio(self.audio_path)
-                except Exception:
-                    has_audio = False
-                if has_audio:
-                    cmd += ["-i", self.audio_path]
-            
-            if use_hevc:
-                if hasattr(media, "hevc_nvenc_arguments"):
-                    cmd += list(media.hevc_nvenc_arguments(quality, 0))
-                else:
-                    cmd += ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", str(crf), "-pix_fmt", "yuv420p"]
-            elif use_h264nvenc:
-                cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", str(crf), "-pix_fmt", "yuv420p"]
-            else:
-                cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
-            
-            if suffix in {'.mp4', '.mov'}:
-                cmd += ["-movflags", "+faststart"]
-                
+        media = MediaTools()
+        ffmpeg_bin = media.ffmpeg
+        crf = int(26 - quality * 0.6)
+        suffix = os.path.splitext(output_path)[1].lower()
+        use_hevc = media.nvenc_works(0, quality) if suffix in {'.mp4', '.mov', '.mkv'} else False
+        use_h264nvenc = media._h264_nvenc_works(0) if suffix == '.avi' else False
+        
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}",
+            "-r", str(self.fps),
+            "-i", "-",
+        ]
+        has_audio = False
+        if self.audio_path and os.path.exists(self.audio_path):
+            try:
+                has_audio = media.has_audio(self.audio_path)
+            except Exception:
+                has_audio = False
             if has_audio:
-                cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-                
-            cmd.append(self.output_path)
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.is_ffmpeg = True
-        except Exception:
-            import cv2
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.out = cv2.VideoWriter(output_path, fourcc, fps, (self.width, self.height))
-            if not self.out.isOpened():
-                raise RuntimeError(f"Failed to create output video: {output_path}")
+                cmd += ["-i", self.audio_path]
+        
+        if use_hevc:
+            cmd += list(media.hevc_nvenc_arguments(quality, 0))
+        elif use_h264nvenc:
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", str(crf), "-pix_fmt", "yuv420p"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        
+        if suffix in {'.mp4', '.mov'}:
+            cmd += ["-movflags", "+faststart"]
+            
+        if has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+            
+        cmd.append(self.output_path)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def write(self, frames_tensor):
         import torch
         import numpy as np
-        import cv2
         
-        if self.is_ffmpeg and self.proc:
+        if self.proc and self.proc.stdin:
             if isinstance(frames_tensor, torch.Tensor):
                 f_cpu = frames_tensor.detach().cpu()
                 if f_cpu.shape[1] in (1, 3, 4) and f_cpu.shape[-1] not in (1, 3, 4):
@@ -522,22 +579,18 @@ class VideoWriter:
                     f_np = np.clip(f_np, 0, 255).astype(np.uint8)
                 f_bytes = f_np.tobytes()
             self.proc.stdin.write(f_bytes)
-        elif self.out:
-            import cv2
-            frames_np = frames_tensor.cpu().numpy() if isinstance(frames_tensor, torch.Tensor) else frames_tensor
-            frames_np = np.clip(frames_np, 0.0, 1.0)
-            frames_np = (frames_np * 255).astype(np.uint8)
-            for i in range(frames_np.shape[0]):
-                frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
-                self.out.write(frame_bgr)
 
     def release(self):
-        if self.is_ffmpeg and self.proc:
-            self.proc.stdin.close()
-            self.proc.wait()
-        elif self.out:
-            self.out.release()
-
+        if self.proc:
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+                if self.proc.stderr:
+                    self.proc.stderr.close()
+                self.proc.wait()
+            except Exception:
+                pass
+            self.proc = None
 def format_time(seconds):
     """
     Format seconds into HH:MM:SS or MM:SS

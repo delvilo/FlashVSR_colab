@@ -305,5 +305,43 @@ class TestFlashVSRCoreAndTESpeed(unittest.TestCase):
             data = json.loads(lines[0])
             self.assertEqual(data["message"], "Test message for JSONL")
             self.assertEqual(data["level"], "INFO")
+
+    def test_native_gaussian_blur(self):
+        from src.pipelines.base import gaussian_blur_2d
+        x = torch.randn(1, 4, 32, 32)
+        blurred = gaussian_blur_2d(x, kernel_size=15, sigma=5.0)
+        self.assertEqual(blurred.shape, x.shape)
+        self.assertFalse(torch.isnan(blurred).any().item())
+
+    def test_zero_opencv_reader_and_writer(self):
+        from cli_main import VideoReader, VideoWriter
+        import tempfile
+        test_video = "/home/AI/F1.mp4"
+        if os.path.exists(test_video):
+            reader = VideoReader(test_video, start_frame=0, end_frame=4, chunk_size=4)
+            fps, total = reader.get_info()
+            self.assertGreater(fps, 0)
+            self.assertGreater(total, 0)
+            frames = next(reader)
+            self.assertEqual(frames.shape[0], 4)
+            self.assertEqual(frames.dim(), 4)
+            reader.release()
+
+            with tempfile.TemporaryDirectory() as td:
+                out_mp4 = os.path.join(td, "zero_cv_out.mp4")
+                writer = VideoWriter(out_mp4, fps=fps, width=frames.shape[2], height=frames.shape[1], quality=8)
+                writer.write(frames)
+                writer.release()
+                self.assertTrue(os.path.exists(out_mp4))
+                self.assertGreater(os.path.getsize(out_mp4), 0)
+
+    def test_requirements_no_torchvision_no_opencv(self):
+        req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        with open(req_path, "r", encoding="utf-8") as f:
+            content = f.read().lower()
+        self.assertNotIn("torchvision", content)
+        self.assertNotIn("opencv", content)
+        self.assertIn("torchcodec", content)
+
 if __name__ == '__main__':
     unittest.main()

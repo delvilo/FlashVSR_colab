@@ -2,7 +2,21 @@ import torch
 import gc
 import numpy as np
 from PIL import Image
-from torchvision.transforms import GaussianBlur
+import torch.nn.functional as F
+
+def gaussian_blur_2d(tensor: torch.Tensor, kernel_size: int = 33, sigma: float = 10.0) -> torch.Tensor:
+    """Pure PyTorch depthwise-convolution 2D Gaussian blur replacing torchvision.transforms.GaussianBlur."""
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    channels = tensor.shape[1]
+    radius = kernel_size // 2
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=tensor.device)
+    kernel_1d = torch.exp(-coords**2 / (2 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = (kernel_1d[:, None] * kernel_1d[None, :]).expand(channels, 1, kernel_size, kernel_size)
+    orig_dtype = tensor.dtype
+    out = F.conv2d(tensor.float(), kernel_2d.float(), padding=radius, groups=channels)
+    return out.to(orig_dtype)
 
 class BasePipeline(torch.nn.Module):
 
@@ -49,13 +63,13 @@ class BasePipeline(torch.nn.Module):
     
     def merge_latents(self, value, latents, masks, scales, blur_kernel_size=33, blur_sigma=10.0):
         if len(latents) > 0:
-            blur = GaussianBlur(kernel_size=blur_kernel_size, sigma=blur_sigma)
+            # blur mask using native Gaussian blur
             height, width = value.shape[-2:]
             weight = torch.ones_like(value)
             for latent, mask, scale in zip(latents, masks, scales):
                 mask = self.preprocess_image(mask.resize((width, height))).mean(dim=1, keepdim=True) > 0
                 mask = mask.repeat(1, latent.shape[1], 1, 1).to(dtype=latent.dtype, device=latent.device)
-                mask = blur(mask)
+                mask = gaussian_blur_2d(mask, kernel_size=blur_kernel_size, sigma=blur_sigma)
                 value += latent * mask * scale
                 weight += mask * scale
             value /= weight
